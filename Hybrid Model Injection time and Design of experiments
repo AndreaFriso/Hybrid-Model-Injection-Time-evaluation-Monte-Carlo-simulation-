@@ -213,7 +213,7 @@ def compute_injection_time(travel_mm, friction_profile, label=""):
     idx = np.where(x >= x_end)[0]
 
     if len(idx) == 0:
-        print(f"⚠ Injection not completed: {label}")
+        print(f"Injection not completed: {label}")
         return np.nan, t, x
 
     return t[idx[0]], t, x
@@ -281,3 +281,4 @@ print("\nInjection time uncertainty decomposition:")
 print(f"Total uncertainty      Δt = {Δt_tot:.3f} s")
 print(f"Mechanistic contribution   = {Δt_mech:.3f} s ({100*w_mech:.1f}%)")
 print(f"Data-driven contribution   = {Δt_dd:.3f} s ({100*w_dd:.1f}%)")
+
