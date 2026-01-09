@@ -1,0 +1,283 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import math
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score
+
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, Input
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.backend import clear_session
+
+from scipy.integrate import odeint
+from scipy.interpolate import interp1d
+
+
+# --- Mechanistic friction parameters
+viscosity = 0.1        # [Pa s]
+r_barrel = 0.00735     # [m]
+theta = 20610         # calibrated effective parameter
+
+# --- Injection dynamics parameters
+m = 0.012              # [kg]
+k = 1200               # [N/m]
+l0 = 0.045              # [m]
+x_end = 0.035          # [m] (35 mm)
+
+# --- Hydrodynamic parameters
+mu_oil = 0.1           # [Pa s]
+d_oil = 1.5e-9         # [m]
+mu_F = 0.003           # [Pa s]
+Ln = 0.02              # [m]
+rn = 0.00015           # [m]
+rb = r_barrel
+l_stopper = 0.007      # [m]
+
+
+
+paths = [
+    r"C:\Users\Andrea\OneDrive - University College London (1)\Desktop\Ph.D\Data\Hypack04_9281826\GSK_DATA_Hypack_04_928_192mm_test1.csv",
+    r"C:\Users\Andrea\OneDrive - University College London (1)\Desktop\Ph.D\Data\Hypack04_9281826\GSK_DATA_Hypack_04_928_192mm_test2.csv",
+    r"C:\Users\Andrea\OneDrive - University College London (1)\Desktop\Ph.D\Data\Hypack04_9281826\GSK_DATA_Hypack_04_928_192mm_test3.csv",
+    r"C:\Users\Andrea\OneDrive - University College London (1)\Desktop\Ph.D\Data\Hypack04_9281826\GSK_DATA_Hypack_04_928_192mm_test4.csv"
+]
+
+data = [pd.read_csv(p) for p in paths]
+
+travels = [d['Travel [mm]'].values for d in data]
+frictions = [d['Friction [N]'].values for d in data]
+speeds = [d['Target Speed [mm/min]'].values[0] / 60000 for d in data]
+interferences = [d['Max interference [μm]'].values[0] for d in data]
+
+
+def friction_mechanistic(speed, travel, theta):
+    return (2 * math.pi * viscosity * r_barrel * theta) * speed * np.ones(len(travel))
+
+pred_mech = [friction_mechanistic(s, t, theta) for s, t in zip(speeds, travels)]
+residuals = [f - p for f, p in zip(frictions, pred_mech)]
+
+x_train = np.vstack([
+    np.column_stack((travels[0], np.full_like(travels[0], interferences[0]))),
+    np.column_stack((travels[2], np.full_like(travels[2], interferences[2]))),
+    np.column_stack((travels[3], np.full_like(travels[3], interferences[3])))
+])
+
+y_train = np.concatenate([residuals[0], residuals[2], residuals[3]])
+
+x_val = np.column_stack((travels[1], np.full_like(travels[1], interferences[1])))
+y_val = residuals[1]
+
+scaler_x = StandardScaler()
+scaler_y = StandardScaler()
+
+X_train = scaler_x.fit_transform(x_train)
+X_val = scaler_x.transform(x_val)
+
+y_train_s = scaler_y.fit_transform(y_train.reshape(-1,1)).flatten()
+y_val_s = scaler_y.transform(y_val.reshape(-1,1)).flatten()
+
+
+def build_ann(input_dim, dropout=0.5):
+    model = Sequential([
+        Input(shape=(input_dim,)),
+        Dense(64, activation="relu"),
+        Dropout(dropout),
+        Dense(64, activation="relu"),
+        Dropout(dropout),
+        Dense(1)
+    ])
+    model.compile(optimizer=Adam(1e-3), loss="mse")
+    return model
+
+model = build_ann(X_train.shape[1])
+model.fit(X_train, y_train_s, epochs=200, batch_size=32, verbose=0)
+
+def mc_dropout(model, X, n=200):
+    preds = np.array([model(X, training=True).numpy().flatten() for _ in range(n)])
+    return preds.mean(axis=0), preds.std(axis=0)
+
+mean_do_s, std_do_s = mc_dropout(model, X_val)
+mean_do = scaler_y.inverse_transform(mean_do_s.reshape(-1,1)).flatten()
+std_do = scaler_y.inverse_transform(std_do_s.reshape(-1,1)).flatten()
+
+def hyperparameter_mc(X_train, y_train, X_eval, scaler_y, n_mc=30, epochs=200):
+    preds = []
+
+    for _ in range(n_mc):
+        clear_session()
+
+        model = Sequential([
+            Input(shape=(X_train.shape[1],)),
+            Dense(np.random.choice([32,64,128]), activation="relu"),
+            Dropout(np.random.uniform(0.2,0.6)),
+            Dense(np.random.choice([32,64,128]), activation="relu"),
+            Dropout(np.random.uniform(0.2,0.6)),
+            Dense(1)
+        ])
+
+        lr = 10 ** np.random.uniform(-4, -2.5)
+        model.compile(optimizer=Adam(lr), loss="mse")
+        model.fit(X_train, y_train, epochs=epochs, batch_size=32, verbose=0)
+
+        pred = model.predict(X_eval).flatten()
+        preds.append(scaler_y.inverse_transform(pred.reshape(-1,1)).flatten())
+
+    preds = np.array(preds)
+    return preds.mean(axis=0), preds.std(axis=0)
+
+mean_hp, std_hp = hyperparameter_mc(X_train, y_train_s, X_val, scaler_y)
+
+def mc_theta(theta, speed, travel, N=5000):
+    sigma = 0.1 * theta
+    sims = [
+        friction_mechanistic(speed, travel, np.random.normal(theta, sigma))
+        for _ in range(N)
+    ]
+    sims = np.array(sims)
+    return sims.mean(axis=0), sims.std(axis=0)
+
+mean_theta, std_theta = mc_theta(theta, speeds[1], travels[1])
+
+pred_hybrid = pred_mech[1] + mean_do
+std_total = np.sqrt(std_theta**2 + std_hp**2)
+
+min_friction  = pred_hybrid - std_total
+mean_friction = pred_hybrid
+max_friction  = pred_hybrid + std_total
+mech_friction = pred_mech[1]
+
+
+travel = travels[1]
+
+
+plt.figure(figsize=(8,5))
+plt.plot(travel, mech_friction, label=r"$Mechanistic prediction$")
+plt.plot(travel, mean_friction, label=r"$Hybrid prediction$")
+plt.fill_between(travel, min_friction, max_friction, alpha = 0.3)
+plt.grid(True, alpha=0.4)
+plt.xlabel('Travel [mm]')
+plt.ylabel('Friction [N]')
+plt.legend()
+plt.show()
+
+def injection_time_model(state, t, m, k, l0, friction_fun):
+    x, v = state
+
+    Kf = (2 * np.pi * mu_oil * rb * l_stopper) / d_oil
+    Kh = (8 * np.pi * mu_F * Ln * rb**4) / rn**4
+    K_hydro = Kf + Kh
+
+    dxdt = v
+    dvdt = (k * (l0 - x) - friction_fun(x) - K_hydro * v) / m
+    return [dxdt, dvdt]
+
+
+def constant_friction(f):
+    return lambda x: f  # restituisce sempre il valore costante
+
+
+def make_friction_interpolator(travel_mm, friction_profile):
+    travel_m = travel_mm / 1000
+
+    travel_m_unique, idx = np.unique(travel_m, return_index=True)
+    friction_unique = friction_profile[idx]
+
+    if len(travel_m_unique) < 2:
+        return lambda x: friction_unique[0]
+
+    return interp1d(
+        travel_m_unique,
+        friction_unique,
+        bounds_error=False,
+        fill_value=(friction_unique[0], friction_unique[-1])
+    )
+
+
+def compute_injection_time(travel_mm, friction_profile, label=""):
+    friction_fun = make_friction_interpolator(travel_mm, friction_profile)
+
+    t = np.linspace(0, 80.0, 6000)
+    state0 = [0.0, 0.0]
+
+    sol = odeint(
+        injection_time_model,
+        state0,
+        t,
+        args=(m, k, l0, friction_fun)
+    )
+
+    x = sol[:, 0]
+    idx = np.where(x >= x_end)[0]
+
+    if len(idx) == 0:
+        print(f"⚠ Injection not completed: {label}")
+        return np.nan, t, x
+
+    return t[idx[0]], t, x
+
+
+
+friction_fun_mech = constant_friction(mech_friction[0])
+t_mech, tgrid, x_mech = compute_injection_time(travel, mech_friction, "Mech")
+t_min, _, x_min = compute_injection_time(travel, min_friction, "Hybrid min")
+t_mean, _, x_mean = compute_injection_time(travel, mean_friction, "Hybrid mean")
+t_max, _, x_max = compute_injection_time(travel, max_friction, "Hybrid max")
+
+print("\nInjection times:")
+print(f"Mechanistic   : {t_mech:.4f} s")
+print(f"Hybrid min    : {t_min:.4f} s")
+print(f"Hybrid mean   : {t_mean:.4f} s")
+print(f"Hybrid max    : {t_max:.4f} s")
+
+
+plt.figure(figsize=(8,5))
+plt.plot(tgrid, x_mech*1000, label="Mech", linewidth=2)
+plt.plot(tgrid, x_mean*1000, label="Hybrid mean", linewidth=2)
+plt.fill_between(tgrid, x_min*1000, x_max*1000, alpha=0.3, label="Hybrid uncertainty")
+plt.axhline(35, color="red", linestyle="--", label="End of injection")
+plt.xlabel("Time [s]")
+plt.ylabel("Plunger position [mm]")
+plt.title("Injection dynamics with friction uncertainty")
+plt.legend()
+plt.grid(True, alpha=0.4)
+plt.tight_layout()
+plt.show()
+
+
+## now we can check the different contribution to the uncertainty
+# --- only mechanistic uncertainty 
+friction_mech_min = pred_mech[1] - std_theta
+friction_mech_max = pred_mech[1] + std_theta
+friction_mech_mean = pred_mech[1]
+
+# --- only data-driven uncertainty
+friction_dd_min = pred_mech[1] + (mean_do - std_hp)
+friction_dd_max = pred_mech[1] + (mean_do + std_hp)
+friction_dd_mean = pred_mech[1] + mean_do
+
+# --- mechanistic ONLY
+t_mech_min, _, _ = compute_injection_time(travel, friction_mech_min, "Mech min")
+t_mech_mean, _, _ = compute_injection_time(travel, friction_mech_mean, "Mech mean")
+t_mech_max, _, _ = compute_injection_time(travel, friction_mech_max, "Mech max")
+
+# --- Data-driven ONLY
+t_dd_min, _, _ = compute_injection_time(travel, friction_dd_min, "DD min")
+t_dd_mean, _, _ = compute_injection_time(travel, friction_dd_mean, "DD mean")
+t_dd_max, _, _ = compute_injection_time(travel, friction_dd_max, "DD max")
+
+
+Δt_mech = t_mech_max - t_mech_min
+Δt_dd   = t_dd_max   - t_dd_min
+Δt_tot  = t_max      - t_min
+
+w_mech = Δt_mech / Δt_tot
+w_dd   = Δt_dd   / Δt_tot
+
+
+print("\nInjection time uncertainty decomposition:")
+print(f"Total uncertainty      Δt = {Δt_tot:.3f} s")
+print(f"Mechanistic contribution   = {Δt_mech:.3f} s ({100*w_mech:.1f}%)")
+print(f"Data-driven contribution   = {Δt_dd:.3f} s ({100*w_dd:.1f}%)")
